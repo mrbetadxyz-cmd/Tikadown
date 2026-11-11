@@ -1,18 +1,16 @@
 name: Run Telegram Bot
 
 on:
-  schedule:
-    # Run every 5 hours (before the 6-hour GitHub Actions timeout)
-    - cron: '0 */5 * * *'
   workflow_dispatch:
 
 concurrency:
   group: soft4p-bot-instance
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 100
 
     steps:
       - name: Checkout Code
@@ -24,10 +22,20 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
+      - name: Restore Database Cache
+        uses: actions/cache/restore@v4
+        with:
+          path: database.db
+          key: soft4p-db-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            soft4p-db-
+
       - name: Install System Dependencies (ffmpeg)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg
+          fi
 
       - name: Install Python Dependencies
         run: |
@@ -38,16 +46,27 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           OWNER_ID: ${{ secrets.OWNER_ID }}
+          LOG_GROUP_ID: ${{ secrets.LOG_GROUP_ID }}
           USERBOT_API_ID: ${{ secrets.USERBOT_API_ID }}
           USERBOT_API_HASH: ${{ secrets.USERBOT_API_HASH }}
           USERBOT_CHANNEL_ID: ${{ secrets.USERBOT_CHANNEL_ID }}
           TELETHON_SESSION: ${{ secrets.TELETHON_SESSION }}
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          WORKER_SECRET: ${{ secrets.WORKER_SECRET }}
+          IDLE_TIMEOUT_SECONDS: "300"
+          MAX_RUN_SECONDS: "5400"
           COOKIES_CONTENT: ${{ secrets.YOUTUBE_COOKIES }}
         run: |
           if [ -n "$COOKIES_CONTENT" ]; then
             echo "$COOKIES_CONTENT" > cookies.txt
             echo "Loaded cookies.txt from secrets."
           fi
-          
-          # Run bot with a safe timeout of 5h 50m (to cleanly cycle before GitHub hard cancels)
-          timeout 21000 python bot.py || true
+
+          python bot.py
+
+      - name: Save Database Cache
+        if: always() && hashFiles('database.db') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: database.db
+          key: soft4p-db-${{ github.run_id }}-${{ github.run_attempt }}

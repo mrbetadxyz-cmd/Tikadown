@@ -4,6 +4,7 @@ from aiogram import BaseMiddleware
 from aiogram.types import TelegramObject, Message, CallbackQuery, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.utils.markdown import hbold
+from config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +21,7 @@ REQUIRED_CHANNELS = [
     }
 ]
 
-OWNER_ID = 1334814727
+OWNER_ID = settings.owner_id
 
 async def get_unjoined_channels(bot, user_id: int) -> List[Dict[str, str]]:
     """

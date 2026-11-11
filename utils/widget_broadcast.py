@@ -10,7 +10,7 @@ from handlers.start import make_bot_footer
 from utils.database import get_all_users
 
 logger = logging.getLogger(__name__)
-OWNER_ID = 1334814727
+OWNER_ID = settings.owner_id
 WIDGET_HEIGHT = 258
 
 

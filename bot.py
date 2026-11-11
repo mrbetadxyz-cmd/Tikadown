@@ -6,14 +6,17 @@ except ImportError:
     pass
 import logging
 from logging.handlers import RotatingFileHandler
+import signal
 import sys
 import time
-from aiogram import Bot, Dispatcher
+import aiohttp
+from aiogram import BaseMiddleware, Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BotCommand
+from aiogram.types import BotCommand, TelegramObject, Update
 
 from config import settings
 from handlers import router as main_router
+from handlers.downloader import has_active_transfers
 
 # Setup logging with size-based rotation (max 10MB x 4 files)
 logging.basicConfig(
@@ -55,6 +58,8 @@ def seconds_until_midnight():
     return (midnight - now).total_seconds()
 
 async def send_daily_backup(bot: Bot):
+    if not OWNER_ID or settings.worker_url:
+        return
     db_file = Path("database.db")
     while True:
         sleep_secs = seconds_until_midnight()
@@ -73,6 +78,90 @@ async def send_daily_backup(bot: Bot):
                 logger.info("Daily backup sent to owner successfully.")
             except Exception as e:
                 logger.error(f"Failed to send daily backup: {e}")
+
+
+class ActivityTrackingMiddleware(BaseMiddleware):
+    """Tracks recent user updates and active handler count for On-Demand auto-sleep."""
+
+    def __init__(self, state: dict):
+        self.state = state
+
+    async def __call__(self, handler, event: TelegramObject, data: dict):
+        self.state["last_activity"] = time.monotonic()
+        self.state["in_flight"] += 1
+        try:
+            return await handler(event, data)
+        finally:
+            self.state["in_flight"] = max(0, self.state["in_flight"] - 1)
+            self.state["last_activity"] = time.monotonic()
+
+
+async def _pop_and_replay_worker_updates(bot: Bot, dp: Dispatcher, activity_state: dict):
+    """Fetch buffered Telegram updates from Cloudflare Worker and feed them to Dispatcher."""
+    worker_base = settings.worker_url.rstrip("/")
+    headers = {"Authorization": f"Bearer {settings.worker_secret}"}
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+            async with session.post(f"{worker_base}/pop-updates", headers=headers) as resp:
+                if resp.status != 200:
+                    logger.warning(f"Worker /pop-updates returned status {resp.status}")
+                    return
+                data = await resp.json()
+    except Exception as e:
+        logger.error(f"Failed to fetch buffered updates from Worker: {e}")
+        return
+
+    items = data.get("updates") or []
+    if not items:
+        return
+
+    logger.info(f"Replaying {len(items)} buffered update(s) from Cloudflare Worker...")
+    activity_state["last_activity"] = time.monotonic()
+
+    async def _run_item(item: dict):
+        chat_id = item.get("chat_id")
+        status_msg_id = item.get("status_msg_id")
+        if chat_id and status_msg_id:
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=status_msg_id)
+            except Exception:
+                pass
+        try:
+            upd = Update.model_validate(item["update"])
+            await dp.feed_update(bot, upd)
+        except Exception as e:
+            logger.error(f"Failed to replay buffered update: {e}")
+
+    for item in items:
+        asyncio.create_task(_run_item(item))
+
+
+async def _idle_watchdog(dp: Dispatcher, activity_state: dict, start_ts: float):
+    """Stops polling cleanly after inactivity or max runtime when running in On-Demand mode."""
+    while True:
+        await asyncio.sleep(15)
+        now = time.monotonic()
+        if activity_state["in_flight"] > 0 or has_active_transfers():
+            activity_state["last_activity"] = now
+            continue
+
+        idle_exceeded = (
+            settings.idle_timeout_seconds > 0
+            and (now - activity_state["last_activity"]) >= settings.idle_timeout_seconds
+        )
+        max_run_exceeded = (
+            settings.max_run_seconds > 0
+            and (now - start_ts) >= settings.max_run_seconds
+        )
+
+        if idle_exceeded or max_run_exceeded:
+            reason = "idle timeout" if idle_exceeded else "max runtime"
+            logger.info(f"On-Demand {reason} reached. Stopping bot cleanly to save runner minutes...")
+            try:
+                await dp.stop_polling()
+            except Exception as e:
+                logger.warning(f"stop_polling raised: {e}")
+            break
 
 def _purge_stale_downloads(download_dir: Path, max_age_seconds: int) -> tuple[int, int]:
     """
@@ -135,6 +224,11 @@ async def main():
     
     # Using MemoryStorage for simple FSM state tracking
     dp = Dispatcher(storage=MemoryStorage())
+
+    on_demand_mode = bool(settings.worker_url)
+    activity_state = {"last_activity": time.monotonic(), "in_flight": 0}
+    if on_demand_mode:
+        dp.update.outer_middleware(ActivityTrackingMiddleware(activity_state))
     
     # Register outer middlewares for checking channel join status
     from utils.force_join import ForceJoinMiddleware
@@ -152,18 +246,45 @@ async def main():
     await set_commands(bot)
     
     # Start background tasks for daily backups and periodic temp cleanup
-    asyncio.create_task(send_daily_backup(bot))
-    asyncio.create_task(cleanup_downloads_periodically())
+    backup_task = asyncio.create_task(send_daily_backup(bot))
+    cleanup_task = asyncio.create_task(cleanup_downloads_periodically())
+    watchdog_task = None
     
-    logger.info("Starting Soft4P Telegram Bot...")
+    logger.info(
+        "Starting Soft4P Telegram Bot (%s mode)...",
+        "On-Demand Worker" if on_demand_mode else "Standard 24/7",
+    )
     print("Soft4P Bot is starting and polling updates...")
     
     try:
-        # Skip accumulated updates (avoids spam when bot starts)
-        await bot.delete_webhook(drop_pending_updates=True)
+        # In On-Demand mode, keep any updates arriving right as webhook is removed
+        await bot.delete_webhook(drop_pending_updates=not on_demand_mode)
+
+        if on_demand_mode:
+            asyncio.create_task(_pop_and_replay_worker_updates(bot, dp, activity_state))
+            watchdog_task = asyncio.create_task(
+                _idle_watchdog(dp, activity_state, time.monotonic())
+            )
+
         # Start polling
         await dp.start_polling(bot)
     finally:
+        for t in (backup_task, cleanup_task, watchdog_task):
+            if t and not t.done():
+                t.cancel()
+
+        if on_demand_mode:
+            webhook_endpoint = f"{settings.worker_url.rstrip('/')}/webhook"
+            try:
+                await bot.set_webhook(
+                    url=webhook_endpoint,
+                    secret_token=settings.worker_secret or None,
+                    drop_pending_updates=False,
+                )
+                logger.info(f"Restored Telegram webhook to {webhook_endpoint}")
+            except Exception as e:
+                logger.error(f"Failed to restore Telegram webhook: {e}")
+
         await bot.session.close()
         try:
             await userbot_client.disconnect()

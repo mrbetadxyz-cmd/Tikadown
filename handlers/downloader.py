@@ -37,7 +37,7 @@ QUALITY_VOICE = "q_voice"
 CANCEL_DOWNLOAD = "q_cancel"
 TRANSFER_CANCEL = "xfer_cancel"
 QUEUE_REMOVE_PREFIX = "q_rm:"
-LOG_GROUP_ID = -1003570311220
+LOG_GROUP_ID = settings.log_group_id
 
 # Active download/upload registry keyed by (chat_id, progress_message_id)
 ACTIVE_TRANSFERS: dict[tuple[int, int], dict] = {}
@@ -45,6 +45,15 @@ ACTIVE_TRANSFERS: dict[tuple[int, int], dict] = {}
 CHAT_QUEUE: dict[int, list[dict]] = {}
 CHAT_QUEUE_LOCKS: dict[int, asyncio.Lock] = {}
 CHAT_BUSY_COUNT: dict[int, int] = {}
+
+
+def has_active_transfers() -> bool:
+    """Return True if any download, upload, or queued item is currently active."""
+    if any(v > 0 for v in CHAT_BUSY_COUNT.values()):
+        return True
+    if any(bool(q) for q in CHAT_QUEUE.values()):
+        return True
+    return any(not entry["task"].done() for entry in ACTIVE_TRANSFERS.values())
 
 
 def build_transfer_cancel_markup() -> types.InlineKeyboardMarkup:

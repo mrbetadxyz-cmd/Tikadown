@@ -1,4 +1,4 @@
-aiogram>=3.10.0
+aiogram>=3.31.0
 yt-dlp>=2024.7.16
 curl_cffi>=0.10.0
 aiofiles>=24.1.0
