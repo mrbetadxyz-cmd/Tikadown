@@ -30,6 +30,11 @@ jobs:
           restore-keys: |
             soft4p-db-
 
+      - name: Free Unused Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
       - name: Install System Dependencies (ffmpeg)
         run: |
           if ! command -v ffmpeg >/dev/null 2>&1; then

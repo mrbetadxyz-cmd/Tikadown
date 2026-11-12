@@ -4,14 +4,17 @@
  * Required Cloudflare Bindings & Environment Variables (Secrets):
  * - DB (D1 Database Binding) : Any free Cloudflare D1 database
  * - BOT_TOKEN                : Telegram Bot Token
- * - WEBHOOK_SECRET           : Random secret string for Telegram webhook verification
+ * - WEBHOOK_SECRET           : Random secret string for Telegram webhook verification (optional, defaults to WORKER_SECRET)
  * - WORKER_SECRET            : Random secret string shared with bot.py (/pop-updates)
  * - GH_TOKEN                 : GitHub Personal Access Token (repo + workflow scope)
  * - GH_OWNER                 : GitHub username (e.g. mrbetadxyz-cmd)
  * - GH_REPO                  : GitHub repository name (e.g. Tikadown)
  * - GH_WORKFLOW              : Workflow filename (default: bot.yml)
  * - GH_BRANCH                : Branch name (default: main)
+ * - SELF_WEBHOOK_URL         : Full webhook URL for Cron safety-net (e.g. https://.../webhook)
  */
+
+const DISPATCH_COOLDOWN_SEC = 25;
 
 async function ensureSchema(db) {
   await db
@@ -23,6 +26,21 @@ async function ensureSchema(db) {
         status_msg_id INTEGER,
         created_at INTEGER NOT NULL
       )`
+    )
+    .run();
+
+  await db
+    .prepare(
+      `CREATE TABLE IF NOT EXISTS worker_state (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        last_dispatch_at INTEGER NOT NULL DEFAULT 0
+      )`
+    )
+    .run();
+
+  await db
+    .prepare(
+      `INSERT OR IGNORE INTO worker_state (id, last_dispatch_at) VALUES (1, 0)`
     )
     .run();
 }
@@ -50,21 +68,40 @@ async function hasActiveWorkflowRun(env) {
   const repo = env.GH_REPO;
   const workflow = env.GH_WORKFLOW || "bot.yml";
   const url = `https://api.github.com/repos/${owner}/${repo}/actions/workflows/${workflow}/runs?per_page=5`;
+  const headers = {
+    Authorization: `Bearer ${env.GH_TOKEN}`,
+    Accept: "application/vnd.github+json",
+    "User-Agent": "Soft4P-Wake-Worker",
+  };
 
-  const res = await fetch(url, {
-    headers: {
-      Authorization: `Bearer ${env.GH_TOKEN}`,
-      Accept: "application/vnd.github+json",
-      "User-Agent": "Soft4P-Wake-Worker",
-    },
-  });
-
+  const res = await fetch(url, { headers });
   if (!res.ok) return false;
   const data = await res.json();
   const runs = data?.workflow_runs || [];
-  return runs.some((r) =>
-    ["queued", "in_progress", "waiting", "pending"].includes(r.status)
-  );
+  const nowMs = Date.now();
+  const staleLimitMs = 110 * 60 * 1000; // 110 mins (workflow timeout-minutes is 100)
+
+  let active = false;
+  for (const r of runs) {
+    if (!["queued", "in_progress", "waiting", "pending"].includes(r.status)) {
+      continue;
+    }
+    const createdMs = Date.parse(r.created_at || r.run_started_at || "");
+    if (!Number.isNaN(createdMs) && nowMs - createdMs > staleLimitMs) {
+      // Cancel stuck/zombie GitHub Actions run so it doesn't block new runs
+      try {
+        await fetch(
+          `https://api.github.com/repos/${owner}/${repo}/actions/runs/${r.id}/cancel`,
+          { method: "POST", headers }
+        );
+      } catch {
+        // Ignore cancel failure
+      }
+      continue;
+    }
+    active = true;
+  }
+  return active;
 }
 
 async function triggerWorkflow(env) {
@@ -85,6 +122,44 @@ async function triggerWorkflow(env) {
     body: JSON.stringify({ ref: branch }),
   });
   return res.ok;
+}
+
+async function ensureRunnerStarted(env) {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const cutoffSec = nowSec - DISPATCH_COOLDOWN_SEC;
+
+  // Check recent dispatch lock first (prevents duplicate triggers during GitHub's 1-4s queue delay)
+  const state = await env.DB.prepare(
+    "SELECT last_dispatch_at FROM worker_state WHERE id = 1"
+  ).first();
+  if (state && state.last_dispatch_at > cutoffSec) {
+    return;
+  }
+
+  // Check if GitHub Actions already has a queued or running job
+  const active = await hasActiveWorkflowRun(env);
+  if (active) {
+    return;
+  }
+
+  // Atomically claim the dispatch lock so two simultaneous messages trigger only ONE runner
+  const claim = await env.DB.prepare(
+    "UPDATE worker_state SET last_dispatch_at = ? WHERE id = 1 AND last_dispatch_at <= ?"
+  )
+    .bind(nowSec, cutoffSec)
+    .run();
+
+  if (claim?.meta?.changes === 1) {
+    const ok = await triggerWorkflow(env);
+    if (!ok) {
+      // Release lock if dispatch request itself failed
+      await env.DB.prepare(
+        "UPDATE worker_state SET last_dispatch_at = 0 WHERE id = 1 AND last_dispatch_at = ?"
+      )
+        .bind(nowSec)
+        .run();
+    }
+  }
 }
 
 export default {
@@ -173,24 +248,26 @@ export default {
         );
       }
 
-      // Send friendly queue / wake status message to user
+      // Send friendly queue / wake status message with animated progress bar
+      let statusMsgId = null;
       if (chatId && update?.message) {
         try {
           const msgRes = await tgApi(env.BOT_TOKEN, "sendMessage", {
             chat_id: chatId,
             text:
               `⏳ <b>High-Speed Server Waking Up...</b>\n\n` +
-              `📊 Queue Position: <b>#${position}</b>\n` +
-              `⚡ Estimated Boot Time: <b>~25–45 seconds</b>\n\n` +
-              `<i>Your request is queued and will start automatically as soon as the server comes online.</i>`,
+              `<code>[▓▓░░░░░░░░] 20%</code> • Queuing request...\n` +
+              `📊 Queue Position: <b>#${position}</b>\n\n` +
+              `<i>Your download will start automatically as soon as the server comes online.</i>`,
             parse_mode: "HTML",
             reply_to_message_id: update.message.message_id,
           });
           if (msgRes?.ok && msgRes?.result?.message_id && insertedId) {
+            statusMsgId = msgRes.result.message_id;
             await env.DB.prepare(
               "UPDATE pending_updates SET status_msg_id = ? WHERE id = ?"
             )
-              .bind(msgRes.result.message_id, insertedId)
+              .bind(statusMsgId, insertedId)
               .run();
           }
         } catch {
@@ -198,12 +275,38 @@ export default {
         }
       }
 
-      // Trigger GitHub Actions if not already queued or running
+      // Trigger GitHub Actions only once even if multiple users message simultaneously
       ctx.waitUntil(
         (async () => {
-          const active = await hasActiveWorkflowRun(env);
-          if (!active) {
-            await triggerWorkflow(env);
+          await ensureRunnerStarted(env);
+
+          if (!statusMsgId || !chatId) return;
+
+          const stages = [
+            { delay: 4500, bar: "▓▓▓▓░░░░░░", pct: "40%", label: "Allocating high-speed runner..." },
+            { delay: 5000, bar: "▓▓▓▓▓▓░░░░", pct: "60%", label: "Setting up downloader engine..." },
+            { delay: 6000, bar: "▓▓▓▓▓▓▓▓░░", pct: "80%", label: "Connecting to Telegram..." },
+            { delay: 6000, bar: "▓▓▓▓▓▓▓▓▓░", pct: "95%", label: "Almost ready, starting shortly..." },
+          ];
+
+          for (const stage of stages) {
+            await new Promise((r) => setTimeout(r, stage.delay));
+            try {
+              const editRes = await tgApi(env.BOT_TOKEN, "editMessageText", {
+                chat_id: chatId,
+                message_id: statusMsgId,
+                text:
+                  `⏳ <b>High-Speed Server Waking Up...</b>\n\n` +
+                  `<code>[${stage.bar}] ${stage.pct}</code> • ${stage.label}\n` +
+                  `📊 Queue Position: <b>#${position}</b>\n\n` +
+                  `<i>Your download will start automatically as soon as the server comes online.</i>`,
+                parse_mode: "HTML",
+              });
+              // Stop animating if bot.py already booted and deleted the status message
+              if (!editRes?.ok) break;
+            } catch {
+              break;
+            }
           }
         })()
       );
